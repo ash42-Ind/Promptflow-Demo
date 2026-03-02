@@ -1,0 +1,459 @@
+
+from promptflow import tool
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import shutil
+import os
+import json
+import time
+
+# ============================================================
+# Token estimation helpers (left intact; not used by core flow)
+# ============================================================
+def _safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return default
+
+
+def _estimate_tokens(text: Optional[str]) -> int:
+    txt = text or ""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(txt))
+    except Exception:
+        return max(1, int(len(txt.split()) * 1.3))
+
+
+def _extract_usage(context: Optional[dict]) -> tuple[int, int]:
+    if not isinstance(context, dict):
+        return 0, 0
+
+    in_tokens = 0
+    out_tokens = 0
+
+    usage = context.get("usage") or context.get("token_usage") or {}
+    if isinstance(usage, dict):
+        in_tokens += _safe_int(
+            usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        )
+        out_tokens += _safe_int(
+            usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        )
+
+    total = _safe_int((usage or {}).get("total_tokens", 0))
+    if total and (in_tokens + out_tokens) == 0:
+        in_tokens = int(total * 0.6)
+        out_tokens = total - in_tokens
+
+    return in_tokens, out_tokens
+
+
+# ============================================================
+# .env & file watcher helpers
+# ============================================================
+def _read_dotenv_value(env_path: Path, key: str) -> Optional[str]:
+    if not env_path.exists():
+        return None
+
+    try:
+        with env_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    v = v.strip()
+                    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                        v = v[1:-1]
+                    return v
+    except Exception:
+        return None
+
+    return None
+
+
+def _wipe_project_dir(proj: Path):
+    if not proj.exists():
+        return
+    for item in proj.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        except Exception as ex:
+            raise RuntimeError(f"Failed to delete {item}") from ex
+
+
+FILES_TO_WATCH = [
+    "settings.yaml",
+    "system.yaml",
+    "settings.yml",
+    "system.yml",
+    ".env",
+    "prompts/persona_ventures_candidates.txt",
+    "prompts/extract_graph.txt",
+    "output/entities.parquet",
+    "output/communities.parquet",
+    "output/text_units.parquet",
+    "output/community_reports.parquet",
+    "output/relationships.parquet",
+]
+
+
+def _blobs_modified_recently(cc, prefix: str, project_root: Path, files_to_watch: list[str]) -> bool:
+    """
+    Compare last_modified timestamps for a curated set of files between Blob and local.
+    """
+    prefix = prefix.rstrip("/") + "/"
+    project_root = project_root.resolve()
+    watched_set = {Path(f).as_posix().lstrip("/") for f in files_to_watch}
+
+    for blob in cc.list_blobs(name_starts_with=prefix):
+
+        # Skip ADLS Gen2 folder markers
+        try:
+            md = getattr(blob, "metadata", {}) or {}
+            if str(md.get("hdi_isfolder", "")).lower() == "true":
+                continue
+        except Exception:
+            pass
+
+        name = blob.name[len(prefix):].lstrip("/")
+        if not name or name.endswith("/"):
+            continue
+
+        if name not in watched_set:
+            continue
+
+        local_path = (project_root / name).resolve()
+        if not local_path.exists():
+            print(f"[watch] Missing locally: {name}")
+            return True
+
+        try:
+            local_ts = os.path.getmtime(local_path)
+            remote_ts = blob.last_modified.timestamp()
+        except Exception:
+            # If we can't read timestamps, be conservative and refresh
+            return True
+
+        if remote_ts > local_ts + 1:
+            print(f"[watch] Remote newer: {name}")
+            return True
+
+    return False
+
+
+def resolve_path(path_str: str) -> Path:
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = (Path.cwd() / p).resolve()
+    return p
+
+
+def _find_project_config(project_dir: Path) -> Path:
+    """
+    Find a GraphRAG YAML config in project_dir.
+    First tries top-level (preferred), then falls back to a **recursive** search.
+    """
+    # 1) Top-level check
+    for name in ("system.yaml", "settings.yaml", "system.yml", "settings.yml"):
+        p = project_dir / name
+        if p.exists():
+            return p
+
+    # 2) Recursive search (common in some repos, e.g., config/system.yaml)
+    candidates = list(project_dir.rglob("system.yaml")) + \
+                 list(project_dir.rglob("settings.yaml")) + \
+                 list(project_dir.rglob("system.yml")) + \
+                 list(project_dir.rglob("settings.yml"))
+    # Prefer the shallowest hit to avoid picking up nested temp copies
+    if candidates:
+        candidates.sort(key=lambda x: len(x.relative_to(project_dir).parts))
+        return candidates[0]
+
+    raise FileNotFoundError("No GraphRAG config found in project directory (searched top-level and recursively)")
+
+
+def _assert_real_path(p: Path, label: str):
+    if not p.exists():
+        raise FileNotFoundError(f"{label} does not exist: {p}")
+
+
+def _format_history_context(chat_history: Optional[List[Dict[str, Any]]], max_items: int = 6) -> str:
+    if not chat_history:
+        return ""
+    lines = []
+    for item in chat_history[-max_items:]:
+        if "role" in item and "content" in item:
+            lines.append(f"{item['role']}: {item['content']}")
+        else:
+            q = item.get("inputs", {}).get("question")
+            a = item.get("outputs", {}).get("answer")
+            if q:
+                lines.append(f"user: {q}")
+            if a:
+                lines.append(f"assistant: {a}")
+    return "\n".join(lines)
+
+
+def _print_local_tree(root: Path, max_entries: int = 200):
+    """
+    Small diagnostic: print a trimmed view of the local tree for quick debugging.
+    """
+    try:
+        print(f"[diag] Local tree under: {root}")
+        count = 0
+        for p in sorted(root.rglob("*")):
+            rel = p.relative_to(root)
+            print(" -", rel.as_posix())
+            count += 1
+            if count >= max_entries:
+                print(f" ... (trimmed, showed first {max_entries} entries)")
+                break
+    except Exception as e:
+        print("[diag] Failed to enumerate local tree:", e)
+
+
+def _list_blobs_under_prefix(cc, prefix: str, max_entries: int = 200):
+    """
+    Small diagnostic: list blob names under prefix to confirm structure.
+    """
+    try:
+        print(f"[diag] Blob listing for prefix '{prefix}':")
+        prefix = prefix.rstrip("/") + "/"
+        count = 0
+        for b in cc.list_blobs(name_starts_with=prefix):
+            # Skip folder markers
+            try:
+                md = getattr(b, "metadata", {}) or {}
+                if str(md.get("hdi_isfolder", "")).lower() == "true":
+                    continue
+            except Exception:
+                pass
+            print(" -", b.name)
+            count += 1
+            if count >= max_entries:
+                print(f" ... (trimmed, showed first {max_entries} entries)")
+                break
+    except Exception as e:
+        print("[diag] Failed to list blobs for prefix:", e)
+
+
+# ============================================================
+# Main tool
+# ============================================================
+@tool
+def query_graph_chat(
+    chat_input: str,
+    chat_history: List[Dict[str, Any]] = None,
+    project_dir: str = "",
+    community_level: int = 2,
+    response_type: str = "Multiple Paragraphs",
+    dynamic_community_selection: bool = False,
+    search_mode: str = "local",
+
+    restore_account_url: str = "",
+    restore_container: str = "",
+    restore_prefix: str = "",
+    restore_sas_token: str = "",
+    force_restore: bool = False,
+
+    dry_run: bool = False,
+    search_timeout_seconds: int = 120,
+) -> str:
+
+    import pandas as pd
+    import asyncio
+    import graphrag.api as api
+    from graphrag.config.load_config import load_config
+
+    # ============================================================
+    # Resolve project directory and ensure it exists
+    # ============================================================
+    if not project_dir.strip():
+        raise ValueError("project_dir is required")
+
+    proj = resolve_path(project_dir)
+    proj.mkdir(parents=True, exist_ok=True)
+
+    # ============================================================
+    # RESTORE FROM BLOB FIRST (BEFORE CONFIG LOAD)
+    # - Force a restore if local config is missing.
+    # ============================================================
+    container_client = None
+    if restore_account_url and restore_container and restore_prefix:
+        from azure.storage.blob import ContainerClient
+
+        # Resolve SAS token
+        sas_token = None
+        if restore_sas_token and restore_sas_token.strip():
+            sas_token = restore_sas_token.strip()
+        else:
+            dot_env_path = proj / ".env"
+            sas_from_env = _read_dotenv_value(dot_env_path, "RESTORE_SAS_TOKEN")
+            if sas_from_env:
+                sas_token = sas_from_env
+
+        if not sas_token:
+            raise RuntimeError(
+                "SAS token missing. Provide restore_sas_token or add RESTORE_SAS_TOKEN in the project .env"
+            )
+
+        sas = sas_token.lstrip("?")
+        container_url = f"{restore_account_url.rstrip('/')}/{restore_container}"
+        container_client = ContainerClient.from_container_url(f"{container_url}?{sas}")
+
+        # Determine if we already have a local config
+        local_has_config = any((proj / name).exists() for name in ("system.yaml", "settings.yaml", "system.yml", "settings.yml"))
+        if not local_has_config:
+            # If config is missing locally, force a restore regardless of watcher result.
+            need_restore = True
+            print("[restore] Local config missing — forcing restore from Blob.")
+        else:
+            # Otherwise, rely on watcher and caller's force flag.
+            changed = _blobs_modified_recently(container_client, restore_prefix, proj, FILES_TO_WATCH)
+            need_restore = force_restore or changed
+
+        if need_restore:
+            print("[restore] Restoring files from Blob storage...")
+            # Safety: wipe before restore to avoid stale or conflicting files.
+            _wipe_project_dir(proj)
+            proj.mkdir(parents=True, exist_ok=True)
+
+            prefix = restore_prefix.rstrip("/") + "/"
+            # Optional diagnostics before restore:
+            _list_blobs_under_prefix(container_client, restore_prefix, max_entries=200)
+
+            restored = 0
+            blobs = list(container_client.list_blobs(name_starts_with=prefix))
+            for blob in blobs:
+                try:
+                    md = getattr(blob, "metadata", {})
+                    if str(md.get("hdi_isfolder", "")).lower() == "true":
+                        continue
+                except Exception:
+                    pass
+
+                rel = blob.name[len(prefix):].lstrip("/")
+                if not rel or rel.endswith("/"):
+                    continue
+
+                local = (proj / rel).resolve()
+                local.parent.mkdir(parents=True, exist_ok=True)
+
+                with open(local, "wb") as f:
+                    container_client.get_blob_client(blob.name).download_blob().readinto(f)
+
+                restored += 1
+
+            print(f"[restore] Restored {restored} files.")
+        else:
+            print("[restore] No changes detected. Using local files.")
+    else:
+        print("[restore] Blob restore disabled (missing restore_account_url / restore_container / restore_prefix).")
+
+    # ============================================================
+    # Load GraphRAG config (search top-level, then recursively)
+    # ============================================================
+    try:
+        config_path = _find_project_config(proj)
+    except FileNotFoundError as e:
+        # Diagnostics to help you immediately
+        print("[error] GraphRAG config not found after optional restore.")
+        _print_local_tree(proj, max_entries=200)
+        if container_client is not None:
+            _list_blobs_under_prefix(container_client, restore_prefix, max_entries=200)
+        raise FileNotFoundError(
+            "No GraphRAG config found in project directory (searched top-level and recursively). "
+            "Verify your restore_container/restore_prefix point to the folder that contains "
+            "system.yaml or settings.yaml (or their .yml variants)."
+        ) from e
+
+    print(f"[config] Using GraphRAG config: {config_path}")
+    graphrag_config = load_config(proj)
+
+    # ============================================================
+    # Load Parquet data
+    # ============================================================
+    out = proj / "output"
+
+    required_files = {
+        "entities.parquet": out / "entities.parquet",
+        "communities.parquet": out / "communities.parquet",
+        "community_reports.parquet": out / "community_reports.parquet",
+        "text_units.parquet": out / "text_units.parquet",
+        "relationships.parquet": out / "relationships.parquet",
+    }
+
+    for label, path in required_files.items():
+        _assert_real_path(path, label)
+
+    import pandas as pd
+    entities_df = pd.read_parquet(required_files["entities.parquet"])
+    communities_df = pd.read_parquet(required_files["communities.parquet"])
+    reports_df = pd.read_parquet(required_files["community_reports.parquet"])
+    text_units_df = pd.read_parquet(required_files["text_units.parquet"])
+    relationships_df = pd.read_parquet(required_files["relationships.parquet"])
+
+    covariates_path = out / "covariates.parquet"
+    if covariates_path.exists():
+        covariates_df = pd.read_parquet(covariates_path)
+    else:
+        covariates_df = pd.DataFrame(columns=["id", "entity_id", "content", "text_unit_ids"])
+
+    # ============================================================
+    # Build question with history
+    # ============================================================
+    history_context = _format_history_context(chat_history)
+    question = (
+        f"{chat_input}\n\n[Prior conversation]\n{history_context}"
+        if history_context
+        else chat_input
+    )
+
+    # ============================================================
+    # Execute GraphRAG search
+    # ============================================================
+    import asyncio
+    import graphrag.api as api
+
+    async def _run():
+        if search_mode.lower() == "local":
+            return await api.local_search(
+                config=graphrag_config,
+                text_units=text_units_df,
+                entities=entities_df,
+                relationships=relationships_df,
+                covariates=covariates_df,
+                communities=communities_df,
+                community_reports=reports_df,
+                community_level=community_level,
+                query=question,
+                response_type=response_type,
+            )
+        else:
+            return await api.global_search(
+                config=graphrag_config,
+                entities=entities_df,
+                communities=communities_df,
+                community_reports=reports_df,
+                community_level=community_level,
+                dynamic_community_selection=dynamic_community_selection,
+                response_type=response_type,
+                query=question,
+            )
+
+    response, context = asyncio.run(
+        asyncio.wait_for(_run(), timeout=search_timeout_seconds)
+    )
+
+    return response
