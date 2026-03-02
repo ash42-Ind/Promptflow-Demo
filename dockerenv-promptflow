@@ -1,0 +1,58 @@
+# Docker File
+
+FROM mcr.microsoft.com/azureml/promptflow/promptflow-runtime:latest
+
+# Install system tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Add micromamba for a lightweight conda layer (runtime only) ---
+ENV MAMBA_ROOT_PREFIX=/opt/micromamba
+RUN curl -L https://micro.mamba.pm/api/micromamba/linux-64/latest \
+    | tar -xvj bin/micromamba && mv bin/micromamba /usr/local/bin/micromamba
+
+# Create a small env that upgrades C++ runtime to satisfy ICU 78 requirements
+# libstdcxx-ng>=15 provides CXXABI_1.3.15; include icu>=78 to align if present.
+RUN micromamba create -y -n runtime -c conda-forge \
+    libstdcxx-ng>=15 icu>=78 && \
+    micromamba clean --all -y
+
+# Make the new runtime libraries visible to the loader
+ENV CONDA_PREFIX=/opt/micromamba/envs/runtime
+ENV LD_LIBRARY_PATH=${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}
+
+# Upgrade pip and install Python packages
+RUN python -m pip install --upgrade pip
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Clean up
+RUN pip cache purge || true
+
+
+
+
+
+
+# requirement.txt
+# PromptFlow tool interfaces
+promptflow>=1.7.0
+
+# GraphRAG & friends (versions may vary with your environment)
+# If your base image already ships these, you can keep them unpinned or remove duplicates.
+graphrag>=2.6.0
+lancedb>=0.6.9
+pyarrow>=15.0.0
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Azure OpenAI and auth (liteLLM comes as transitive dep of graphrag)
+openai>=1.37.0
+python-dotenv>=1.0.1
+
+# Parquet/IO extras
+fastparquet>=2024.5.0
+
+# Optional: performance + debugging
+uvloop==0.19.0; platform_system=="Linux"
