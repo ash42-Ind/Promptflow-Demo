@@ -324,42 +324,52 @@ def query_graph_chat(
             need_restore = force_restore or changed
 
         if need_restore:
-            print("[restore] Restoring files from Blob storage...")
-            # Safety: wipe before restore to avoid stale or conflicting files.
-            _wipe_project_dir(proj)
             proj.mkdir(parents=True, exist_ok=True)
-
-            prefix = restore_prefix.rstrip("/") + "/"
-            # Optional diagnostics before restore:
-            _list_blobs_under_prefix(container_client, restore_prefix, max_entries=200)
-
+            prefix = (restore_prefix.rstrip("/") + "/") if restore_prefix else ""
             restored = 0
-            blobs = list(container_client.list_blobs(name_starts_with=prefix))
+
+            print(f"[restore] Restoring from {container_url}, prefix='{prefix}'")
+
+            proj_resolved = proj.resolve()
+
+            def _depth(n: str) -> int:
+                return n.count("/")
+
+            blobs = sorted(container_client.list_blobs(name_starts_with=prefix), key=lambda b: _depth(b.name))
+
             for blob in blobs:
                 try:
-                    md = getattr(blob, "metadata", {})
+                    md = getattr(blob, "metadata", {}) or {}
                     if str(md.get("hdi_isfolder", "")).lower() == "true":
                         continue
                 except Exception:
                     pass
 
-                rel = blob.name[len(prefix):].lstrip("/")
+                rel = blob.name[len(prefix):].lstrip("/") if prefix else blob.name
                 if not rel or rel.endswith("/"):
                     continue
 
                 local = (proj / rel).resolve()
-                local.parent.mkdir(parents=True, exist_ok=True)
+                if not str(local).startswith(str(proj_resolved)):
+                    print(f"[restore][skip] Unsafe path: {local}")
+                    continue
+
+                parent = local.parent
+                if parent.exists() and not parent.is_dir():
+                    parent.unlink()
+                parent.mkdir(parents=True, exist_ok=True)
+
+                if local.exists() and local.is_dir():
+                    shutil.rmtree(local)
 
                 with open(local, "wb") as f:
                     container_client.get_blob_client(blob.name).download_blob().readinto(f)
 
                 restored += 1
 
-            print(f"[restore] Restored {restored} files.")
+            print(f"[restore] Restored {restored} files")
         else:
-            print("[restore] No changes detected. Using local files.")
-    else:
-        print("[restore] Blob restore disabled (missing restore_account_url / restore_container / restore_prefix).")
+            print("[restore] Skipping restore — local files up-to-date")
 
     # ============================================================
     # Load GraphRAG config (search top-level, then recursively)
